@@ -1,10 +1,16 @@
 import json
 import logging
+import asyncio
+import os
+import sys
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-import anthropic
-import os
 from dataclasses import dataclass
+from contextlib import AsyncExitStack
+
+import anthropic
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 
 @dataclass
@@ -73,6 +79,201 @@ class MCPLogger:
         print("="*80)
 
 
+class MCPServerManager:
+    def __init__(self, logger: MCPLogger):
+        self.logger = logger
+        self.servers: Dict[str, Dict[str, Any]] = {}
+        self.exit_stack = AsyncExitStack()
+    
+    async def add_filesystem_server(self, allowed_path: str = "./"):
+        try:
+            server_params = StdioServerParameters(
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-filesystem", allowed_path],
+                env=None
+            )
+            
+            stdio_transport = await self.exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            stdio, write = stdio_transport
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(stdio, write)
+            )
+            
+            await session.initialize()
+            
+            
+            tools_response = await session.list_tools()
+            tools = [{"name": tool.name, "description": tool.description} for tool in tools_response.tools]
+            
+            self.servers["filesystem"] = {
+                "session": session,
+                "tools": tools,
+                "status": "connected",
+                "allowed_path": allowed_path
+            }
+            
+            self.logger.log_interaction(
+                "filesystem", 
+                "server_connection",
+                {"allowed_path": allowed_path},
+                {"tools": tools, "status": "connected"}
+            )
+            
+        except Exception as e:
+            self.logger.log_interaction(
+                "filesystem", 
+                "server_connection",
+                {"allowed_path": allowed_path},
+                {"error": str(e)},
+                "error"
+            )
+            print(f"Error conectando servidor Filesystem: {str(e)}")
+    
+    async def add_git_server(self, repository_path: str = "./"):
+        try:
+            server_params = StdioServerParameters(
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-git", "--repository", repository_path],
+                env=None
+            )
+            
+            stdio_transport = await self.exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            stdio, write = stdio_transport
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(stdio, write)
+            )
+            
+            await session.initialize()
+            
+            
+            tools_response = await session.list_tools()
+            tools = [{"name": tool.name, "description": tool.description} for tool in tools_response.tools]
+            
+            self.servers["git"] = {
+                "session": session,
+                "tools": tools,
+                "status": "connected",
+                "repository_path": repository_path
+            }
+            
+            self.logger.log_interaction(
+                "git", 
+                "server_connection",
+                {"repository_path": repository_path},
+                {"tools": tools, "status": "connected"}
+            )
+            
+            
+        except Exception as e:
+            self.logger.log_interaction(
+                "git", 
+                "server_connection",
+                {"repository_path": repository_path},
+                {"error": str(e)},
+                "error"
+            )
+            print(f"Error conectando servidor Git: {str(e)}")
+    
+    async def add_csv_analysis_server(self, server_path: str = "./csv_analysis_server.py"):
+        try:
+            server_params = StdioServerParameters(
+                command="python",
+                args=[server_path],
+                env=None
+            )
+            
+            stdio_transport = await self.exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+            stdio, write = stdio_transport
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(stdio, write)
+            )
+            
+            await session.initialize()
+            
+            
+            tools_response = await session.list_tools()
+            tools = [{"name": tool.name, "description": tool.description} for tool in tools_response.tools]
+            
+            self.servers["csv_analysis"] = {
+                "session": session,
+                "tools": tools,
+                "status": "connected",
+                "server_path": server_path
+            }
+            
+            self.logger.log_interaction(
+                "csv_analysis", 
+                "server_connection",
+                {"server_path": server_path},
+                {"tools": tools, "status": "connected"}
+            )
+            
+            
+        except Exception as e:
+            self.logger.log_interaction(
+                "csv_analysis", 
+                "server_connection",
+                {"server_path": server_path},
+                {"error": str(e)},
+                "error"
+            )
+            print(f"Error conectando servidor CSV Analysis: {str(e)}")
+    
+    async def call_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if server_name not in self.servers:
+            raise ValueError(f"Servidor {server_name} no está conectado")
+        
+        server = self.servers[server_name]
+        if server["status"] != "connected":
+            raise ValueError(f"Servidor {server_name} no está activo")
+        
+        try:
+            session = server["session"]
+            result = await session.call_tool(tool_name, arguments)
+            
+            response_data = {
+                "content": [{"type": content.type, "text": content.text if hasattr(content, 'text') else str(content)} 
+                           for content in result.content],
+                "isError": result.isError if hasattr(result, 'isError') else False
+            }
+            
+            self.logger.log_interaction(
+                server_name,
+                f"tool_call:{tool_name}",
+                arguments,
+                response_data
+            )
+            
+            return response_data
+        
+        except Exception as e:
+            error_response = {"error": str(e), "isError": True}
+            self.logger.log_interaction(
+                server_name,
+                f"tool_call:{tool_name}",
+                arguments,
+                error_response,
+                "error"
+            )
+            return error_response
+    
+    def get_all_tools(self) -> Dict[str, List[Dict[str, Any]]]:
+        all_tools = {}
+        for server_name, server_info in self.servers.items():
+            if server_info["status"] == "connected":
+                all_tools[server_name] = server_info["tools"]
+        return all_tools
+    
+    async def cleanup(self):
+        await self.exit_stack.aclose()
+
+
 class ConversationContext:    
     def __init__(self, max_messages: int = 50):
         self.messages: List[Dict[str, str]] = []
@@ -120,9 +321,9 @@ class AnthropicLLMClient:
             raise ValueError("Se requiere una API key de Anthropic.")
         
         self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model = "claude-opus-4-1-20250805"  
+        self.model = "claude-3-5-sonnet-20241022"
     
-    def send_message(self, messages: List[Dict[str, str]], max_tokens: int = 1024) -> str:
+    def send_message(self, messages: List[Dict[str, str]], max_tokens: int = 2048) -> str:
         try:
             response = self.client.messages.create(
                 model=self.model,
@@ -140,30 +341,48 @@ class MCPChatbot:
         self.llm_client = AnthropicLLMClient(api_key)
         self.context = ConversationContext()
         self.mcp_logger = MCPLogger()
+        self.server_manager = MCPServerManager(self.mcp_logger)
         
         system_message = """Eres un asistente inteligente que puede usar herramientas MCP (Model Context Protocol) para realizar tareas complejas. 
-        
-Tus capacidades incluyen:
-- Responder preguntas generales usando tu conocimiento base
-- Mantener contexto en conversaciones largas
-- Usar servidores MCP para tareas específicas como análisis de datos, manipulación de archivos, etc.
 
+Tienes acceso a las siguientes capacidades através de servidores MCP:
+- Filesystem: operaciones de archivos seguras (leer, escribir, listar directorios)
+- Git: manipulación de repositorios Git (commits, branches, status, etc.)
+- CSV Analysis: análisis avanzado de datos CSV (estadísticas, visualizaciones, limpieza de datos)
+
+Cuando el usuario solicite operaciones que requieran estas herramientas, usa las funciones MCP apropiadas.
 Siempre sé útil, preciso y mantén un tono amigable y profesional."""
         
         self.context.add_message("system", system_message)
-        
-        print("Chatbot MCP inicializado correctamente!")
-        print("\nComandos especiales:")
-        print("   /log - Mostrar log de interacciones MCP")
-        print("   /context - Mostrar resumen de la conversación")
-        print("   /clear - Limpiar contexto de conversación")
-        print("   /quit - Salir del chatbot")
     
+    async def initialize_servers(self):
+        
+        os.makedirs("./mcp_workspace", exist_ok=True)
+        
+        
+        await self.server_manager.add_filesystem_server("./mcp_workspace")
+        await self.server_manager.add_git_server("./mcp_workspace")
+        
+        
+        await self.server_manager.add_csv_analysis_server()
+            
     def process_special_command(self, user_input: str) -> bool:
         command = user_input.strip().lower()
         
-        if command == "/log":
-            self.mcp_logger.show_interactions_log(limit=10)  
+        if command == "/tools":
+            print("\n" + "="*60)
+            print("HERRAMIENTAS MCP DISPONIBLES")
+            print("="*60)
+            all_tools = self.server_manager.get_all_tools()
+            for server_name, tools in all_tools.items():
+                print(f"\nServidor: {server_name}")
+                for tool in tools:
+                    print(f"   • {tool['name']}: {tool.get('description', 'Sin descripción')}")
+            print("="*60)
+            return True
+        
+        elif command == "/log":
+            self.mcp_logger.show_interactions_log(limit=10)
             return True
         
         elif command == "/context":
@@ -178,32 +397,18 @@ Siempre sé útil, preciso y mantén un tono amigable y profesional."""
             print("Contexto de conversación limpiado.")
             return True
         
+        # elif command == "/demo":
+        #     asyncio.create_task(self.run_demo())
+        #     return True
+        
         elif command == "/quit":
             print("¡Hasta luego! Gracias por usar el chatbot MCP.")
             return True
         
         return False
     
-    def simulate_mcp_interaction(self, server_name: str, request_type: str, 
-                                request_data: Dict[Any, Any]) -> Dict[Any, Any]:    
-        response_data = {
-            "status": "success",
-            "message": f"Simulación de respuesta del servidor {server_name}",
-            "timestamp": datetime.now().isoformat(),
-            "data": {"result": "Operación completada exitosamente"}
-        }
-        
-        self.mcp_logger.log_interaction(
-            server_name=server_name,
-            request_type=request_type,
-            request_data=request_data,
-            response_data=response_data
-        )
-        
-        return response_data
-    
-    def chat_loop(self):
-        print("\n¡Chatbot listo! Escribe tu mensaje o usa comandos especiales.\n")
+    async def chat_loop(self):
+        print("\n¡Chatbot MCP listo!.\n")
         
         while True:
             try:
@@ -220,12 +425,8 @@ Siempre sé útil, preciso y mantén un tono amigable y profesional."""
                 
                 self.context.add_message("user", user_input)
                 
-                if any(keyword in user_input.lower() for keyword in ["csv", "análisis", "datos", "archivo"]):
-                    self.simulate_mcp_interaction(
-                        server_name="csv_analysis_server",
-                        request_type="analyze_data",
-                        request_data={"query": user_input, "file": "example.csv"}
-                    )
+                
+                mcp_response = await self.process_mcp_request(user_input)
                 
                 print("Pensando...", end="", flush=True)
                 messages = self.context.get_messages_for_api()
@@ -241,9 +442,12 @@ Siempre sé útil, preciso y mantén un tono amigable y profesional."""
                 break
             except Exception as e:
                 print(f"\nError inesperado: {str(e)}")
+    
+    async def cleanup(self):
+        await self.server_manager.cleanup()
 
 
-def main():
+async def main():
     print("="*80)
     print("CHATBOT MCP")
     print("="*80)
@@ -253,12 +457,19 @@ def main():
             print("\nNo se encontró la API key de Anthropic.")
             return
         
-        
         chatbot = MCPChatbot()
-        chatbot.chat_loop()
+        
+        
+        await chatbot.initialize_servers()
+        
+        
+        await chatbot.chat_loop()
+        
+        
+        await chatbot.cleanup()
         
     except Exception as e:
         print(f"\nError al inicializar el chatbot: {str(e)}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
