@@ -7,11 +7,13 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from contextlib import AsyncExitStack
+from dotenv import load_dotenv
 
 import anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+load_dotenv()
 
 @dataclass
 class MCPInteraction:
@@ -147,10 +149,11 @@ class MCPServerManager:
     
     async def add_git_server(self, repository_path: str = "./"):
         try:
+            
             server_params = StdioServerParameters(
-                command="npx",
-                args=["-y", "@modelcontextprotocol/server-git", "--repository", repository_path],
-                env=None
+                command="uvx",
+                args=["mcp-server-git"],
+                env={"PWD": repository_path}  
             )
             
             stdio_transport = await self.exit_stack.enter_async_context(
@@ -181,6 +184,12 @@ class MCPServerManager:
                 {"tools": tools, "status": "connected"}
             )
             
+            print(f"Servidor Git conectado exitosamente")
+            print(f"   Directorio: {repository_path}")
+            print(f"   Herramientas disponibles: {len(tools)}")
+            for tool in tools:
+                print(f"      • {tool['name']}: {tool.get('description', 'Sin descripción')}")
+            
         except Exception as e:
             self.logger.log_interaction(
                 "git", 
@@ -190,6 +199,7 @@ class MCPServerManager:
                 "error"
             )
             print(f"Error conectando servidor Git: {str(e)}")
+            print("Consejo: Verificar que 'uvx mcp-server-git' funcione desde terminal")
     
     async def add_csv_analysis_server(self, server_path: str = "/Users/josepereira/Documents/GitHub/mcp_server/csv_mcp_server.py"):
         try:
@@ -471,8 +481,15 @@ class ConversationContext:
         self.messages: List[Dict[str, str]] = []
         self.max_messages = max_messages
         self.conversation_start = datetime.now()
+        
+        self.system_message = None
     
     def add_message(self, role: str, content: str):
+        if role == "system":
+            
+            self.system_message = content
+            return
+            
         message = {
             "role": role,
             "content": content,
@@ -481,13 +498,14 @@ class ConversationContext:
         
         self.messages.append(message)
         
+        
         if len(self.messages) > self.max_messages:
-            system_messages = [msg for msg in self.messages if msg["role"] == "system"]
-            recent_messages = self.messages[-(self.max_messages-len(system_messages)):]
-            self.messages = system_messages + recent_messages
+            self.messages = self.messages[-self.max_messages:]
     
-    def get_messages_for_api(self) -> List[Dict[str, str]]:
-        return [{"role": msg["role"], "content": msg["content"]} for msg in self.messages]
+    def get_messages_for_api(self) -> tuple:
+        
+        conversation_messages = [{"role": msg["role"], "content": msg["content"]} for msg in self.messages]
+        return self.system_message, conversation_messages
     
     def get_conversation_summary(self) -> str:
         total_messages = len(self.messages)
@@ -513,13 +531,16 @@ class AnthropicLLMClient:
             raise ValueError("Se requiere una API key de Anthropic.")
         
         self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model = "claude-3-5-sonnet-20241022"
+        
+        self.model = "claude-sonnet-4-20250514"
     
-    def send_message(self, messages: List[Dict[str, str]], max_tokens: int = 2048) -> str:
+    def send_message(self, system_message: str, messages: List[Dict[str, str]], max_tokens: int = 2048) -> str:
         try:
+            
             response = self.client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,
+                system=system_message,  
                 messages=messages
             )
             return response.content[0].text
@@ -635,8 +656,10 @@ Siempre sé útil, preciso y mantén un tono amigable y profesional."""
             return True
         
         elif command == "/clear":
-            system_messages = [msg for msg in self.context.messages if msg["role"] == "system"]
-            self.context.messages = system_messages
+            
+            system_msg = self.context.system_message
+            self.context.messages = []
+            self.context.system_message = system_msg
             print("Contexto de conversación limpiado.")
             return True
         
@@ -703,8 +726,8 @@ Siempre sé útil, preciso y mantén un tono amigable y profesional."""
                 mcp_suggestion = await self.process_mcp_request(user_input)
                 
                 print("Pensando...", end="", flush=True)
-                messages = self.context.get_messages_for_api()
-                response = self.llm_client.send_message(messages)
+                system_message, messages = self.context.get_messages_for_api()
+                response = self.llm_client.send_message(system_message, messages)
                 print("\r" + " " * 15 + "\r", end="")
                 
                 self.context.add_message("assistant", response)
