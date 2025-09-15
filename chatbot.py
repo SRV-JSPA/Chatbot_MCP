@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from contextlib import AsyncExitStack
 from dotenv import load_dotenv
 import re
+import aiohttp
 
 import anthropic
 from mcp import ClientSession, StdioServerParameters
@@ -76,12 +77,127 @@ class MCPLogger:
         log_message = f"MCP Interaction - Server: {server_name}, Type: {request_type}, Status: {status}"
         self.logger.info(log_message)
 
+class RemoteMCPClient:
+    
+    def __init__(self, base_url: str, server_name: str = "remote_system_monitor"):
+        self.base_url = base_url.rstrip('/')
+        self.server_name = server_name
+        self.tools = []
+        self.session = None
+    
+    async def initialize(self):
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                
+                try:
+                    async with session.get(f"{self.base_url}/health") as response:
+                        if response.status != 200:
+                            return False
+                except Exception:
+                    return False
+                
+                
+                try:
+                    async with session.get(f"{self.base_url}/mcp/tools/list") as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            self.tools = data.get('tools', [])
+                        else:
+                            return False
+                except Exception:
+                    return False
+            
+            return True
+        except Exception:
+            return False
+    
+    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            payload = {
+                "name": tool_name,
+                "arguments": arguments,
+                "id": f"req_{datetime.now().timestamp()}"
+            }
+            
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/mcp/tools/call",
+                    json=payload,
+                    headers={'Content-Type': 'application/json'}
+                ) as response:
+                    
+                    if response.status == 200:
+                        result = await response.json()
+                        
+                        
+                        if 'result' in result:
+                            tool_result = result['result']
+                            return {
+                                "content": tool_result.get('content', []),
+                                "isError": tool_result.get('isError', False),
+                                "server_type": "remote",
+                                "author": "Remote Server"
+                            }
+                        elif 'error' in result:
+                            error_msg = result['error'].get('message', 'Unknown error')
+                            return {
+                                "content": [{"type": "text", "text": f"Remote server error: {error_msg}"}],
+                                "isError": True,
+                                "server_type": "remote",
+                                "author": "Remote Server"
+                            }
+                        else:
+                            return {
+                                "content": [{"type": "text", "text": f"Unexpected response format: {result}"}],
+                                "isError": True,
+                                "server_type": "remote",
+                                "author": "Remote Server"
+                            }
+                    else:
+                        response_text = await response.text()
+                        return {
+                            "content": [{"type": "text", "text": f"HTTP Error {response.status}: {response_text}"}],
+                            "isError": True,
+                            "server_type": "remote",
+                            "author": "Remote Server"
+                        }
+        
+        except asyncio.TimeoutError:
+            return {
+                "content": [{"type": "text", "text": "Remote server timeout - please try again"}],
+                "isError": True,
+                "server_type": "remote",
+                "author": "Remote Server"
+            }
+        except Exception as e:
+            return {
+                "content": [{"type": "text", "text": f"Connection error: {str(e)}"}],
+                "isError": True,
+                "server_type": "remote",
+                "author": "Remote Server"
+            }
+    
+    def get_tools_info(self) -> List[Dict[str, Any]]:
+        tools_with_metadata = []
+        for tool in self.tools:
+            tool_with_metadata = tool.copy()
+            tool_with_metadata.update({
+                "server_type": "remote",
+                "author": "Remote Server",
+                "repository_url": "N/A"
+            })
+            tools_with_metadata.append(tool_with_metadata)
+        return tools_with_metadata
+
 class MCPServerManager:
     def __init__(self, logger: MCPLogger):
         self.logger = logger
         self.servers: Dict[str, Dict[str, Any]] = {}
         self.exit_stack = AsyncExitStack()
         self.external_servers: List[ExternalMCPServer] = []
+        self.remote_clients: Dict[str, RemoteMCPClient] = {}
         self.config = self._load_server_config()
     
     def _load_server_config(self) -> Dict[str, Any]:
@@ -91,12 +207,54 @@ class MCPServerManager:
             'csv_server_path': os.getenv('CSV_SERVER_PATH', './csv_mcp_server.py'),
             'filesystem_path': os.getenv('FILESYSTEM_PATH', './mcp_workspace'),
             'git_path': os.getenv('GIT_PATH', './mcp_workspace'),
+            'remote_server_url': os.getenv('REMOTE_MCP_URL'),
         }
         return config
+    
+    async def add_remote_server(self, server_url: str, server_name: str = "remote_system_monitor"):
+        try:
+            remote_client = RemoteMCPClient(server_url, server_name)
+            
+            if await remote_client.initialize():
+                self.remote_clients[server_name] = remote_client
+                
+                
+                self.servers[server_name] = {
+                    "session": None,
+                    "tools": [{"name": tool["name"], "description": tool["description"]} for tool in remote_client.tools],
+                    "status": "connected",
+                    "type": "remote",
+                    "base_url": server_url,
+                    "author": "Remote Server"
+                }
+                
+                self.logger.log_interaction(
+                    server_name, 
+                    "remote_server_connection",
+                    {"base_url": server_url, "server_type": "remote"},
+                    {"tools": self.servers[server_name]["tools"], "status": "connected", "server_type": "remote"},
+                    "success"
+                )
+                
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            self.logger.log_interaction(
+                server_name, 
+                "remote_server_connection",
+                {"base_url": server_url, "server_type": "remote"},
+                {"error": str(e)},
+                "error"
+            )
+            return False
     
     async def add_filesystem_server(self, allowed_path: str = None):
         if allowed_path is None:
             allowed_path = self.config['filesystem_path']
+        
+        os.makedirs(allowed_path, exist_ok=True)
             
         try:
             server_params = StdioServerParameters(
@@ -145,6 +303,8 @@ class MCPServerManager:
     async def add_git_server(self, repository_path: str = None):
         if repository_path is None:
             repository_path = self.config['git_path']
+        
+        os.makedirs(repository_path, exist_ok=True)
             
         try:
             server_params = StdioServerParameters(
@@ -208,7 +368,7 @@ class MCPServerManager:
                 break
         
         if not actual_path:
-            raise FileNotFoundError(f"CSV server not found in any of: {possible_paths}")
+            return
             
         try:
             workspace = os.path.abspath(self.config['workspace_dir'])
@@ -259,7 +419,6 @@ class MCPServerManager:
                 {"error": str(e)},
                 "error"
             )
-            raise
     
     def register_external_server(self, external_server: ExternalMCPServer):
         self.external_servers.append(external_server)
@@ -352,6 +511,41 @@ class MCPServerManager:
         return successful_connections, failed_connections
     
     async def call_tool(self, server_name: str, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if server_name in self.remote_clients:
+            try:
+                result = await self.remote_clients[server_name].call_tool(tool_name, arguments)
+                
+                self.logger.log_interaction(
+                    server_name,
+                    f"tool_call:{tool_name}",
+                    arguments,
+                    result,
+                    "success" if not result.get("isError", False) else "error"
+                )
+                
+                return result
+                
+            except Exception as e:
+                error_response = {
+                    "error": str(e), 
+                    "isError": True,
+                    "server_type": "remote",
+                    "content": [{
+                        "type": "text",
+                        "text": f"Error calling remote tool: {str(e)}"
+                    }]
+                }
+                
+                self.logger.log_interaction(
+                    server_name,
+                    f"tool_call:{tool_name}",
+                    arguments,
+                    error_response,
+                    "error"
+                )
+                
+                return error_response
+        
         if server_name not in self.servers:
             raise ValueError(f"Server {server_name} not connected")
         
@@ -392,21 +586,21 @@ class MCPServerManager:
                             "text": str(content)
                         })
             
-            if hasattr(result, 'isError'):
-                response_data["isError"] = result.isError
+            if hasattr(result, 'isError') and result.isError:
+                response_data["isError"] = True
             
             if not response_data["content"]:
                 response_data["content"] = [{
                     "type": "text",
-                    "text": "Tool returned no content"
+                    "text": f"Tool {tool_name} executed successfully"
                 }]
-                response_data["isError"] = True
             
             self.logger.log_interaction(
                 server_name,
                 f"tool_call:{tool_name}",
                 arguments,
-                response_data
+                response_data,
+                "error" if response_data["isError"] else "success"
             )
             
             return response_data
@@ -450,8 +644,15 @@ class MCPServerManager:
             return error_response
     
     async def validate_server_connection(self, server_name: str) -> bool:
-        if server_name not in self.servers:
+        if server_name not in self.servers and server_name not in self.remote_clients:
             return False
+        
+        if server_name in self.remote_clients:
+            try:
+                result = await self.remote_clients[server_name].call_tool("system_monitor_info", {})
+                return not result.get("isError", True)
+            except:
+                return False
         
         server = self.servers[server_name]
         if server["status"] != "connected":
@@ -461,12 +662,21 @@ class MCPServerManager:
             if server_name == "csv_analysis":
                 result = await self.call_tool(server_name, "debug_workspace", {})
                 return not result.get("isError", True)
+            elif server_name == "filesystem":
+                workspace = self.config['filesystem_path']
+                test_path = os.path.join(workspace, "connection_test.txt")
+                result = await self.call_tool(server_name, "write_file", {
+                    "path": test_path,
+                    "content": "connection test"
+                })
+                return not result.get("isError", True)
             return True
         except:
             return False
     
     def get_all_tools(self) -> Dict[str, List[Dict[str, Any]]]:
         all_tools = {}
+        
         for server_name, server_info in self.servers.items():
             if server_info["status"] == "connected":
                 tools_with_metadata = []
@@ -480,19 +690,34 @@ class MCPServerManager:
                     tools_with_metadata.append(tool_with_metadata)
                 
                 all_tools[server_name] = tools_with_metadata
+        
+        for server_name, remote_client in self.remote_clients.items():
+            if server_name not in all_tools:
+                all_tools[server_name] = remote_client.get_tools_info()
+        
         return all_tools
     
     def get_external_servers_summary(self) -> str:
         external_servers = {name: info for name, info in self.servers.items() 
                            if info.get("type") == "external"}
         
-        if not external_servers:
+        remote_servers = {name: {
+            "author": "Remote Server",
+            "description": f"Remote MCP server at {client.base_url}",
+            "repository_url": "N/A",
+            "tools": client.tools,
+            "type": "remote"
+        } for name, client in self.remote_clients.items()}
+        
+        all_external = {**external_servers, **remote_servers}
+        
+        if not all_external:
             return "No external servers connected."
         
-        summary = f"External servers connected ({len(external_servers)}):\n"
+        summary = f"External servers connected ({len(all_external)}):\n"
         summary += "=" * 50 + "\n"
         
-        for server_name, server_info in external_servers.items():
+        for server_name, server_info in all_external.items():
             summary += f"\n{server_name}\n"
             summary += f"   Author: {server_info.get('author', 'N/A')}\n"
             summary += f"   Description: {server_info.get('description', 'N/A')}\n"
@@ -500,7 +725,9 @@ class MCPServerManager:
             summary += f"   Tools: {len(server_info.get('tools', []))}\n"
             
             for tool in server_info.get('tools', []):
-                summary += f"      • {tool['name']}: {tool.get('description', 'No description')}\n"
+                tool_name = tool.get('name', 'unnamed') if isinstance(tool, dict) else getattr(tool, 'name', 'unnamed')
+                tool_desc = tool.get('description', 'No description') if isinstance(tool, dict) else getattr(tool, 'description', 'No description')
+                summary += f"      • {tool_name}: {tool_desc}\n"
         
         return summary
     
@@ -574,367 +801,225 @@ class AnthropicLLMClient:
         except Exception as e:
             return f"Error communicating with Claude: {str(e)}"
 
-class MCPToolExecutor:
-    def __init__(self, server_manager):
+class IntelligentToolExecutor:
+    
+    def __init__(self, server_manager: MCPServerManager, llm_client: AnthropicLLMClient):
         self.server_manager = server_manager
-        self.intent_patterns = self._load_intent_patterns()
-        self.csv_mappings = self._load_csv_mappings()
-        self.column_patterns = self._load_column_patterns()
-        
-    def _load_intent_patterns(self) -> Dict[str, Dict]:
-        return {
-            'analyze_data': {
-                'keywords': ['analizar', 'analiza', 'analyze', 'estadisticas', 'statistics', 'resumen', 'summary'],
-                'server': 'csv_analysis',
-                'tool': 'analyze_csv'
-            },
-            'create_visualization': {
-                'keywords': ['histograma', 'grafico', 'visualiza', 'crea un', 'boxplot', 'scatter', 'visualizacion', 'grafica', 'plot', 'chart'],
-                'server': 'csv_analysis',
-                'tool': 'create_csv_visualization'
-            },
-            'detect_outliers': {
-                'keywords': ['outliers', 'atipicos', 'anomalias', 'valores extremos', 'outlier', 'anomaly'],
-                'server': 'csv_analysis',
-                'tool': 'detect_outliers_in_csv'
-            },
-            'correlations': {
-                'keywords': ['correlacion', 'correlaciones', 'correlation', 'relacion', 'relationship'],
-                'server': 'csv_analysis',
-                'tool': 'calculate_correlations_csv'
-            },
-            'filter_data': {
-                'keywords': ['filtra', 'filter', 'filtrar', 'mostrar solo', 'show only', 'where', 'condicion'],
-                'server': 'csv_analysis',
-                'tool': 'filter_csv_data'
-            },
-            'clean_data': {
-                'keywords': ['limpia', 'clean', 'limpiar', 'duplicados', 'duplicates', 'valores nulos', 'missing values', 'null'],
-                'server': 'csv_analysis',
-                'tool': 'clean_csv_data'
-            },
-            'group_data': {
-                'keywords': ['agrupa', 'group', 'agrupar', 'group by', 'suma por', 'promedio por', 'aggregation'],
-                'server': 'csv_analysis',
-                'tool': 'group_csv_data'
-            },
-            'file_operation': {
-                'keywords': ['lista', 'list', 'archivos', 'files', 'directorio', 'workspace', 'debug'],
-                'server': 'filesystem',
-                'tool': 'list_directory'
-            }
-        }
+        self.llm_client = llm_client
     
-    def _load_csv_mappings(self) -> Dict[str, str]:
-        mappings = {
-            'estudiantes': 'estudiantes.csv',
-            'ventas': 'ventas.csv', 
-            'simple': 'simple.csv',
-            'sales': 'sales.csv',
-            'data': 'data.csv',
-            'datos': 'datos.csv'
-        }
+    def get_tools_for_llm(self) -> str:
+        all_tools = self.server_manager.get_all_tools()
         
-        env_mappings = os.getenv('CSV_MAPPINGS')
-        if env_mappings:
-            try:
-                additional_mappings = json.loads(env_mappings)
-                mappings.update(additional_mappings)
-            except:
-                pass
-                
-        return mappings
-    
-    def _load_column_patterns(self) -> List[str]:
-        return [
-            r'columna\s+(\w+)',
-            r'de\s+la?\s+(\w+)',
-            r'variable\s+(\w+)',
-            r'campo\s+(\w+)',
-            r'column\s+(\w+)',
-            r'para\s+(\w+)',
-            r'sobre\s+(\w+)'
-        ]
+        tools_description = "AVAILABLE MCP TOOLS:\n\n"
         
-    def detect_tool_intent(self, user_input: str) -> dict:
-        user_lower = user_input.lower()
-        
-        for intent_name, intent_config in self.intent_patterns.items():
-            if any(keyword in user_lower for keyword in intent_config['keywords']):
-                return {
-                    'server': intent_config['server'],
-                    'tool': intent_config['tool'],
-                    'intent': intent_name
-                }
-        
-        return {'intent': None}
-    
-    def extract_filter_conditions(self, user_input: str) -> List[Dict]:
-        filters = []
-        user_lower = user_input.lower()
-        
-        import re
-        
-        number_patterns = [
-            r'mayor(?:es)?\s+(?:a|que)\s+(\d+(?:\.\d+)?)',
-            r'greater\s+than\s+(\d+(?:\.\d+)?)',
-            r'>\s*(\d+(?:\.\d+)?)',
-            r'menor(?:es)?\s+(?:a|que)\s+(\d+(?:\.\d+)?)',
-            r'less\s+than\s+(\d+(?:\.\d+)?)',
-            r'<\s*(\d+(?:\.\d+)?)',
-            r'igual(?:es)?\s+(?:a)?\s+(\d+(?:\.\d+)?)',
-            r'equals?\s+(\d+(?:\.\d+)?)',
-            r'=\s*(\d+(?:\.\d+)?)'
-        ]
-        
-        for pattern in number_patterns:
-            match = re.search(pattern, user_lower)
-            if match:
-                value = float(match.group(1))
-                
-                column = 'total'
-                if 'precio' in user_lower or 'price' in user_lower:
-                    column = 'precio'
-                elif 'cantidad' in user_lower or 'quantity' in user_lower:
-                    column = 'cantidad'
-                elif 'descuento' in user_lower or 'discount' in user_lower:
-                    column = 'descuento'
-                
-                if 'mayor' in pattern or 'greater' in pattern or '>' in pattern:
-                    operator = 'greater_than'
-                elif 'menor' in pattern or 'less' in pattern or '<' in pattern:
-                    operator = 'less_than'
-                else:
-                    operator = 'equals'
-                
-                filters.append({
-                    'column': column,
-                    'operator': operator,
-                    'value': value
-                })
-                break
-        
-        if 'region' in user_lower and ('norte' in user_lower or 'sur' in user_lower or 'este' in user_lower or 'oeste' in user_lower):
-            region_match = re.search(r'region\s+(\w+)', user_lower)
-            if region_match:
-                filters.append({
-                    'column': 'region',
-                    'operator': 'equals',
-                    'value': region_match.group(1).title()
-                })
-        
-        if 'contiene' in user_lower or 'contains' in user_lower:
-            contains_match = re.search(r'contiene\s+[\'"]?(\w+)[\'"]?', user_lower)
-            if not contains_match:
-                contains_match = re.search(r'contains\s+[\'"]?(\w+)[\'"]?', user_lower)
+        for server_name, tools in all_tools.items():
+            server_info = self.server_manager.servers.get(server_name, {})
+            server_type = server_info.get("type", "unknown")
             
-            if contains_match:
-                column = 'producto'
-                filters.append({
-                    'column': column,
-                    'operator': 'contains',
-                    'value': contains_match.group(1)
-                })
+            tools_description += f"SERVER: {server_name} (type: {server_type})\n"
+            
+            for tool in tools:
+                tools_description += f"  - {tool['name']}: {tool['description']}\n"
+            
+            tools_description += "\n"
         
-        return filters if filters else [{'column': 'total', 'operator': 'greater_than', 'value': 1000}]
+        for server_name, client in self.server_manager.remote_clients.items():
+            tools_description += f"SERVER: {server_name} (type: remote)\n"
+            for tool in client.tools:
+                tools_description += f"  - {tool['name']}: {tool['description']}\n"
+            tools_description += "\n"
+        
+        return tools_description
     
-    def extract_cleaning_operations(self, user_input: str) -> List[str]:
-        operations = []
-        user_lower = user_input.lower()
-        
-        if 'duplicados' in user_lower or 'duplicates' in user_lower:
-            operations.append('drop_duplicates')
-        
-        if 'valores nulos' in user_lower or 'missing values' in user_lower or 'nulos' in user_lower:
-            if 'elimina' in user_lower or 'drop' in user_lower:
-                operations.append('drop_missing')
-            elif 'rellena' in user_lower or 'fill' in user_lower:
-                if 'media' in user_lower or 'mean' in user_lower or 'promedio' in user_lower:
-                    operations.append('fill_missing_mean')
-                elif 'moda' in user_lower or 'mode' in user_lower:
-                    operations.append('fill_missing_mode')
-                else:
-                    operations.append('fill_missing_mean')  
-        
-        return operations if operations else ['drop_duplicates']
-    
-    def extract_grouping_info(self, user_input: str) -> tuple:
-        user_lower = user_input.lower()
-        
-        group_by = []
-        aggregations = {}
-        
-        if 'por region' in user_lower or 'by region' in user_lower:
-            group_by.append('region')
-        if 'por producto' in user_lower or 'by product' in user_lower:
-            group_by.append('producto')
-        if 'por vendedor' in user_lower or 'by seller' in user_lower:
-            group_by.append('vendedor')
-        if 'por mes' in user_lower or 'by month' in user_lower:
-            group_by.append('fecha') 
-        
-        if 'suma' in user_lower or 'sum' in user_lower:
-            if 'total' in user_lower or 'ventas' in user_lower:
-                aggregations['total'] = 'sum'
-            if 'cantidad' in user_lower:
-                aggregations['cantidad'] = 'sum'
-        
-        if 'promedio' in user_lower or 'average' in user_lower or 'mean' in user_lower:
-            if 'total' in user_lower or 'ventas' in user_lower:
-                aggregations['total'] = 'mean'
-            if 'precio' in user_lower:
-                aggregations['precio'] = 'mean'
-            if 'descuento' in user_lower:
-                aggregations['descuento'] = 'mean'
-        
-        if 'conteo' in user_lower or 'count' in user_lower:
-            aggregations['total'] = 'count'
-        
-        if not group_by:
-            group_by = ['region']
-        if not aggregations:
-            aggregations = {'total': 'sum', 'cantidad': 'mean'}
-        
-        return group_by, aggregations
-    
-    def should_save_result(self, user_input: str) -> bool:
-        user_lower = user_input.lower()
-        save_keywords = ['guarda', 'save', 'guardar', 'exporta', 'export']
-        return any(keyword in user_lower for keyword in save_keywords)
-    
-    async def execute_tool_for_intent(self, intent_data: dict, user_input: str) -> str:
+    async def analyze_user_request(self, user_input: str) -> Dict[str, Any]:
         try:
-            if intent_data['intent'] == 'analyze_data':
-                csv_file = self.extract_csv_filename(user_input)
-                if not csv_file:
-                    return "Error: Could not identify CSV file to analyze. Please mention the filename (e.g., ventas.csv)"
-                
-                result = await self.server_manager.call_tool(
-                    'csv_analysis', 
-                    'analyze_csv',
-                    {'file_path': csv_file}
-                )
-                return self.extract_text_from_result(result)
+            tools_info = self.get_tools_for_llm()
             
-            elif intent_data['intent'] == 'create_visualization':
-                csv_file = self.extract_csv_filename(user_input)
-                if not csv_file:
-                    return "Error: Could not identify CSV file. Please mention the filename (e.g., ventas.csv)"
-                
-                plot_type = self.extract_plot_type(user_input)
-                column = self.extract_column_name(user_input)
-                
-                if not column:
-                    return "Error: Could not identify column to visualize. Please specify the column"
-                
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"{csv_file.replace('.csv', '')}_{plot_type}_{column}_{timestamp}.png"
-                
-                result = await self.server_manager.call_tool(
-                    'csv_analysis',
-                    'create_csv_visualization', 
-                    {
-                        'file_path': csv_file,
-                        'plot_type': plot_type,
-                        'columns': [column],
-                        'filename': filename
-                    }
-                )
-                return self.extract_text_from_result(result)
+            workspace_path = self.server_manager.config.get('filesystem_path', './mcp_workspace')
+            git_path = self.server_manager.config.get('git_path', './mcp_workspace')
             
-            elif intent_data['intent'] in ['detect_outliers', 'correlations']:
-                csv_file = self.extract_csv_filename(user_input)
-                if not csv_file:
-                    return "Error: Could not identify CSV file"
-                
-                result = await self.server_manager.call_tool(
-                    'csv_analysis',
-                    intent_data['tool'],
-                    {'file_path': csv_file}
-                )
-                return self.extract_text_from_result(result)
+            analysis_prompt = f"""You are an intelligent tool selector for an MCP chatbot system. 
+
+{tools_info}
+
+WORKSPACE FILES AVAILABLE:
+- estudiantes.csv (academic student data)
+- ventas.csv (commercial sales data)  
+- simple.csv (simple test data)
+
+IMPORTANT FILESYSTEM RULES:
+- The filesystem server can ONLY access files within: {workspace_path}
+- NEVER use relative paths like "." or ".." 
+- ALWAYS use the full workspace path: {workspace_path}
+- For listing files, ALWAYS use path: "{workspace_path}"
+
+IMPORTANT GIT RULES:
+- ALL Git tools require a "repo_path" parameter
+- ALWAYS use repo_path: "{git_path}" for Git operations
+- Git repository is located at: {git_path}
+
+USER REQUEST: "{user_input}"
+
+Analyze this request and determine:
+1. Does the user need MCP tools? (yes/no)
+2. If yes, which server and tool should be used?
+3. What parameters should be passed to the tool?
+
+SERVER SELECTION RULES:
+- For system monitoring (CPU, memory, disk, network, processes): use remote_system_monitor server
+- For CSV analysis: use csv_analysis server  
+- For file operations (create, read, write, list files): use filesystem server
+- For git operations: use git server
+- If user mentions "servidor remoto" or "remote server": prefer remote servers
+
+FILESYSTEM OPERATIONS - Use filesystem server for:
+- "listar archivos" / "list files" → list_directory with path: "{workspace_path}"
+- "crear archivo" / "create file" → write_file with path: "{workspace_path}/filename"
+- "leer archivo" / "read file" → read_text_file with full path
+- "buscar archivos" / "search files" → search_files with path: "{workspace_path}"
+
+GIT OPERATIONS - Use git server for:
+- "status del repositorio" / "git status" → git_status with repo_path: "{git_path}"
+- "commit" / "git commit" → git_commit with repo_path: "{git_path}" and message: "commit message"
+- "add archivos" / "git add" → git_add with repo_path: "{git_path}" and files: ["file1", "file2"]
+- "log de commits" / "git log" → git_log with repo_path: "{git_path}"
+- "crear rama" / "create branch" → git_create_branch with repo_path: "{git_path}" and branch_name: "new_branch"
+
+EXAMPLE RESPONSES:
+
+For: "Lista los archivos en el directorio"
+{{
+"needs_tools": true,
+"server_name": "filesystem",
+"tool_name": "list_directory", 
+"arguments": {{"path": "{workspace_path}"}},
+"reasoning": "User wants to list files - use filesystem server with workspace path"
+}}
+
+For: "Muestra el status del repositorio git"
+{{
+"needs_tools": true,
+"server_name": "git",
+"tool_name": "git_status", 
+"arguments": {{"repo_path": "{git_path}"}},
+"reasoning": "User wants git status - use git server with repo_path"
+}}
+
+For: "Haz commit de los cambios con mensaje 'mi commit'"
+{{
+"needs_tools": true,
+"server_name": "git",
+"tool_name": "git_commit", 
+"arguments": {{"repo_path": "{git_path}", "message": "mi commit"}},
+"reasoning": "User wants to commit changes - use git server with repo_path and message"
+}}
+
+For: "Agrega el archivo test.txt al staging"
+{{
+"needs_tools": true,
+"server_name": "git",
+"tool_name": "git_add", 
+"arguments": {{"repo_path": "{git_path}", "files": ["test.txt"]}},
+"reasoning": "User wants to add file to git - use git server with repo_path and files"
+}}
+
+CRITICAL: 
+- Always use full paths starting with {workspace_path} for filesystem operations!
+- Always use repo_path: "{git_path}" for Git operations!
+
+Respond with valid JSON only:
+{{
+"needs_tools": true/false,
+"server_name": "server_name",
+"tool_name": "tool_name", 
+"arguments": {{}},
+"reasoning": "explanation of your decision"
+}}"""
+
+            response = self.llm_client.send_message(
+                "You are a precise tool selector. Respond only with valid JSON.",
+                [{"role": "user", "content": analysis_prompt}]
+            )
             
-            elif intent_data['intent'] == 'filter_data':
-                csv_file = self.extract_csv_filename(user_input)
-                if not csv_file:
-                    return "Error: Could not identify CSV file"
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group()
+                analysis = json.loads(json_str)
+                return analysis
+            else:
+                return {"needs_tools": False, "reasoning": "Could not parse LLM response"}
                 
-                filters = self.extract_filter_conditions(user_input)
-                save_filtered = self.should_save_result(user_input)
-                
-                result = await self.server_manager.call_tool(
-                    'csv_analysis',
-                    'filter_csv_data',
-                    {
-                        'file_path': csv_file,
-                        'filters': filters,
-                        'save_filtered': save_filtered
-                    }
-                )
-                return self.extract_text_from_result(result)
+        except json.JSONDecodeError as e:
+            return {"needs_tools": False, "reasoning": f"JSON parse error: {str(e)}"}
+        except Exception as e:
+            return {"needs_tools": False, "reasoning": f"Error in analysis: {str(e)}"}
+    
+    async def execute_intelligent_tool_call(self, analysis: Dict[str, Any]) -> Optional[str]:
+        try:
+            if not analysis.get("needs_tools", False):
+                return None
             
-            elif intent_data['intent'] == 'clean_data':
-                csv_file = self.extract_csv_filename(user_input)
-                if not csv_file:
-                    return "Error: Could not identify CSV file"
-                
-                operations = self.extract_cleaning_operations(user_input)
-                save_cleaned = self.should_save_result(user_input)
-                
-                result = await self.server_manager.call_tool(
-                    'csv_analysis',
-                    'clean_csv_data',
-                    {
-                        'file_path': csv_file,
-                        'operations': operations,
-                        'save_cleaned': save_cleaned
-                    }
-                )
-                return self.extract_text_from_result(result)
+            server_name = analysis.get("server_name")
+            tool_name = analysis.get("tool_name")
+            arguments = analysis.get("arguments", {})
             
-            elif intent_data['intent'] == 'group_data':
-                csv_file = self.extract_csv_filename(user_input)
-                if not csv_file:
-                    return "Error: Could not identify CSV file"
-                
-                group_by, aggregations = self.extract_grouping_info(user_input)
-                save_grouped = self.should_save_result(user_input)
-                
-                result = await self.server_manager.call_tool(
-                    'csv_analysis',
-                    'group_csv_data',
-                    {
-                        'file_path': csv_file,
-                        'group_by': group_by,
-                        'aggregations': aggregations,
-                        'save_grouped': save_grouped
-                    }
-                )
-                return self.extract_text_from_result(result)
+            if not server_name or not tool_name:
+                return "Error: Could not determine which tool to use"
             
-            elif intent_data['intent'] == 'file_operation':
-                workspace_dir = self.server_manager.config['workspace_dir']
-                result = await self.server_manager.call_tool(
-                    'filesystem',
-                    'list_directory',
-                    {'path': workspace_dir}
-                )
-                return self.extract_text_from_result(result)
+            if server_name == "git" and "repo_path" not in arguments:
+                git_path = self.server_manager.config.get('git_path', './mcp_workspace')
+                arguments["repo_path"] = git_path
             
-            return "Error: Could not execute the requested tool"
+            if server_name in self.server_manager.remote_clients and "csv" in tool_name.lower():
+                arguments = await self._prepare_remote_arguments(tool_name, arguments)
+            
+            result = await self.server_manager.call_tool(server_name, tool_name, arguments)
+            
+            return self._extract_text_from_result(result)
             
         except Exception as e:
-            return f"Error executing MCP tool: {str(e)}"
+            return f"Error executing tool {tool_name} on {server_name}: {str(e)}"
     
-    def extract_text_from_result(self, result: dict) -> str:
+    async def _prepare_remote_arguments(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if not arguments and "csv" in tool_name.lower():
+            arguments = {"file_path": "estudiantes.csv"}
+        
+        if "csv" in tool_name.lower() and "file_path" in arguments:
+            file_path = arguments["file_path"]
+            workspace_dir = self.server_manager.config['workspace_dir']
+            full_path = os.path.join(workspace_dir, file_path)
+            
+            if os.path.exists(full_path):
+                try:
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        csv_content = f.read()
+                    
+                    remote_args = {
+                        "csv_content": csv_content,
+                        "file_name": file_path
+                    }
+                    
+                    for key, value in arguments.items():
+                        if key not in ["file_path"] and key in ["plot_type", "columns", "method", "filters", "operations", "group_by", "aggregations"]:
+                            remote_args[key] = value
+                    
+                    return remote_args
+                    
+                except Exception:
+                    return arguments
+        
+        return arguments
+    
+    def _extract_text_from_result(self, result: Dict[str, Any]) -> str:
         try:
             if result.get('isError', False):
                 error_msg = result.get('error', 'Unknown error')
                 return f"Error in MCP tool: {error_msg}"
             
             content = result.get('content', [])
+            
             if not content:
-                return "MCP tool returned no content"
+                return "MCP tool completed successfully"
             
             text_parts = []
             for item in content:
@@ -952,63 +1037,10 @@ class MCPToolExecutor:
             if text_parts:
                 return '\n'.join(text_parts)
             else:
-                return "Could not extract text from MCP result"
+                return "MCP tool completed successfully"
                 
         except Exception as e:
             return f"Error processing MCP result: {str(e)}"
-    
-    def extract_csv_filename(self, text: str) -> str:
-        csv_pattern = r'(\w+\.csv)'
-        matches = re.findall(csv_pattern, text.lower())
-        if matches:
-            return matches[0]
-        
-        words = text.split()
-        for word in words:
-            clean_word = word.strip('.,!?()[]{}";:')
-            if clean_word.endswith('.csv'):
-                return clean_word
-        
-        text_lower = text.lower()
-        for keyword, filename in self.csv_mappings.items():
-            if keyword in text_lower:
-                return filename
-        
-        return None
-    
-    def extract_plot_type(self, text: str) -> str:
-        text_lower = text.lower()
-        
-        plot_mappings = {
-            'histograma': 'histogram',
-            'boxplot': 'boxplot',
-            'box plot': 'boxplot',
-            'scatter': 'scatter',
-            'dispersion': 'scatter',
-            'correlacion': 'correlation_heatmap',
-            'correlation': 'correlation_heatmap',
-            'bar': 'bar',
-            'barras': 'bar'
-        }
-        
-        for keyword, plot_type in plot_mappings.items():
-            if keyword in text_lower:
-                return plot_type
-                
-        return 'histogram'
-    
-    def extract_column_name(self, text: str) -> str:
-        for pattern in self.column_patterns:
-            match = re.search(pattern, text.lower())
-            if match:
-                return match.group(1)
-        
-        known_columns = ['edad', 'calificacion', 'asistencia', 'semestre', 'nombre', 'id', 'age', 'score', 'attendance', 'precio', 'cantidad', 'total', 'descuento', 'region', 'producto', 'vendedor']
-        for col in known_columns:
-            if col in text.lower():
-                return col
-        
-        return None
 
 class MCPChatbot:
     def __init__(self, api_key: Optional[str] = None):
@@ -1018,24 +1050,34 @@ class MCPChatbot:
         self.server_manager = MCPServerManager(self.mcp_logger)
         
         workspace_dir = self.server_manager.config['workspace_dir']
-        system_message = f"""You are an intelligent assistant specialized in data analysis using MCP tools.
+        system_message = f"""You are an intelligent assistant with access to MCP (Model Context Protocol) tools for enhanced capabilities.
 
-Your main function is to interpret the results you receive from MCP tools and present them clearly and usefully.
+Your main function is to help users with various tasks using the available MCP tools when appropriate.
 
 AVAILABLE FILES in {workspace_dir}/:
 - estudiantes.csv (academic student data)
-- ventas.csv (commercial data)  
+- ventas.csv (commercial sales data)  
 - simple.csv (simple test data)
+
+CAPABILITIES:
+- General conversation and knowledge questions
+- System monitoring (CPU, memory, disk, network, processes)
+- File system operations
+- Git repository management  
+- CSV data analysis
+- Data visualization
+- Statistical analysis
 
 IMPORTANT: 
 - When you receive results from MCP tools, interpret and present them clearly
-- If you don't receive tool results, explain that you need to execute the corresponding tools
-- Maintain a professional and pedagogical tone
+- Maintain a professional and helpful tone
 - Highlight the most important insights from analyses
+- If no MCP tools are needed, respond normally with your knowledge
 
 Workspace: {workspace_dir}"""
         
         self.context.add_message("system", system_message)
+        self.intelligent_executor = None
     
     async def initialize_servers(self):
         workspace_dir = self.server_manager.config['workspace_dir']
@@ -1043,10 +1085,16 @@ Workspace: {workspace_dir}"""
         
         await self.server_manager.add_filesystem_server("./mcp_workspace")
         await self.server_manager.add_git_server("./mcp_workspace")
-        await self.server_manager.add_csv_analysis_server("/Users/josepereira/Documents/GitHub/mcp_server/csv_mcp_server.py")
+        await self.server_manager.add_csv_analysis_server()
+        
+        remote_url = self.server_manager.config['remote_server_url']
+        if remote_url:
+            await self.server_manager.add_remote_server(remote_url, "remote_system_monitor")
         
         if self.server_manager.external_servers:
-            successful, failed = await self.server_manager.connect_external_servers()
+            await self.server_manager.connect_external_servers()
+        
+        self.intelligent_executor = IntelligentToolExecutor(self.server_manager, self.llm_client)
     
     def process_special_command(self, user_input: str) -> bool:
         command = user_input.strip().lower()
@@ -1056,9 +1104,7 @@ Workspace: {workspace_dir}"""
         try:
             cleanup_task = asyncio.create_task(self.server_manager.cleanup())
             await asyncio.wait_for(cleanup_task, timeout=5.0)
-        except asyncio.TimeoutError:
-            pass
-        except Exception as e:
+        except:
             pass
 
 class EnhancedTerminalUI:
@@ -1084,14 +1130,14 @@ class EnhancedTerminalUI:
     def show_welcome_screen(self):
         self.clear_screen()
         
-        welcome_text = """Welcome to the [bold bright_blue]MCP Chatbot[/bold bright_blue]!
+        welcome_text = """Welcome to the MCP Chatbot!
         """
         
         welcome_panel = Panel(
             Markdown(welcome_text),
             border_style=self.colors['primary'],
             padding=(1, 2),
-            title="[bold bright_blue]Chatbot[/bold bright_blue]"
+            title="[bold bright_blue]MCP Chatbot[/bold bright_blue]"
         )
         
         self.console.print(welcome_panel)
@@ -1112,7 +1158,7 @@ class EnhancedTerminalUI:
         menu_table = Table(show_header=False, box=None, padding=(0, 2))
         
         commands = [
-            ("Chat", "Chat with assistant", "/chat"),
+            ("Chat", "Intelligent chat with MCP tools", "/chat"),
             ("Tools", "View available MCP tools", "/tools"),
             ("Servers", "Manage MCP servers", "/servers"),
             ("Log MCP", "View MCP interactions in real time", "/log"),
@@ -1136,7 +1182,7 @@ class EnhancedTerminalUI:
         
         self.console.print(menu_panel)
     
-    def show_server_status(self, servers: dict):
+    def show_server_status(self, servers: dict, remote_clients: dict = None):
         status_table = Table(title="MCP Server Status")
         status_table.add_column("Server", style=self.colors['primary'])
         status_table.add_column("Status", justify="center")
@@ -1160,22 +1206,37 @@ class EnhancedTerminalUI:
                 server_type.title()
             )
         
+        if remote_clients:
+            for client_name, client in remote_clients.items():
+                if client_name not in servers:
+                    status_table.add_row(
+                        client_name,
+                        f"[{self.colors['success']}]REMOTE[/]",
+                        str(len(client.tools)),
+                        "Remote"
+                    )
+        
         self.console.print(status_table)
         
-    
     def show_tools_grid(self, all_tools: dict):
         panels = []
         
         for server_name, tools in all_tools.items():
             tool_list = []
             for tool in tools:
-                tool_list.append(f"• {tool['name']}")
+                tool_name = tool.get('name', 'unnamed') if isinstance(tool, dict) else str(tool)
+                tool_list.append(f"• {tool_name}")
             
-            if server_name == "csv_analysis":
-                border_color = self.colors['success']
-                title_prefix = "[Real Execution] "
+            server_type = tools[0].get('server_type', 'unknown') if tools and isinstance(tools[0], dict) else 'unknown'
+            
+            if server_type == "remote":
+                border_color = self.colors['accent']
+                title_prefix = "[Remote] "
+            elif server_type in ["csv_analysis", "own"]:
+                border_color = self.colors['success'] 
+                title_prefix = "[Local] "
             else:
-                border_color = self.colors['secondary'] 
+                border_color = self.colors['secondary']
                 title_prefix = ""
             
             server_panel = Panel(
@@ -1191,15 +1252,17 @@ class EnhancedTerminalUI:
     
     def show_chat_interface(self):
         chat_panel = Panel(
-            "[bold]Chat Mode[/bold]\n\n"
-            "[cyan]Check log with /log to confirm tool execution[/cyan]\n\n"
+            "[bold]Enhanced Chat Mode[/bold]\n\n"
+            "[green]✓ Intelligent tool selection enabled[/green]\n"
+            "[blue]✓ Local and remote MCP servers active[/blue]\n"
+            "[cyan]✓ System monitoring available[/cyan]\n\n"
             "Special commands:\n"
             f"[{self.colors['muted']}]• /tools - View available MCP tools[/]\n"
             f"[{self.colors['muted']}]• /log - View MCP call history[/]\n"
             f"[{self.colors['muted']}]• /clear - Clear context[/]\n"
             f"[{self.colors['muted']}]• /menu - Return to main menu[/]",
             border_style=self.colors['accent'],
-            title="Chat Interface"
+            title="Intelligent Chat Interface"
         )
         self.console.print(chat_panel)
     
@@ -1214,7 +1277,7 @@ class EnhancedTerminalUI:
         else:
             color = self.colors['success']
             icon = "Claude"
-            title = "Claude [Real MCP]"
+            title = "Claude [Enhanced MCP]"
         
         if len(content) > 100:
             if '```' in content or 'def ' in content or 'import ' in content:
@@ -1234,43 +1297,56 @@ class EnhancedTerminalUI:
         self.console.print(message_panel)
     
     def show_interaction_log(self, interactions: list, limit: int = 10):
-        log_table = Table(title=f"Last {limit} MCP Interactions - Execution Verification")
+        log_table = Table(title=f"Last {limit} MCP Interactions - Enhanced Tool Execution")
         log_table.add_column("Time", style=self.colors['muted'])
         log_table.add_column("Server", style=self.colors['primary'])
         log_table.add_column("Tool", style=self.colors['secondary'])
         log_table.add_column("Status", justify="center")
+        log_table.add_column("Type", style=self.colors['accent'])
         
         recent_interactions = interactions[-limit:] if interactions else []
         
         if not recent_interactions:
             no_interactions_panel = Panel(
-                "[yellow]NO MCP INTERACTIONS REGISTERED[/yellow]\n\n"
-                "[red]This could indicate that:[/red]\n"
-                "• Claude is not using MCP tools\n"
-                "• Queries don't require specific tools\n"
-                "• There's a connection problem with servers\n\n"
-                "[cyan]Try making a specific CSV query[/cyan]",
-                border_style="yellow",
-                title="Warning"
+                "[yellow]NO MCP INTERACTIONS YET[/yellow]\n\n"
+                "[cyan]The enhanced system will automatically determine when to use MCP tools[/cyan]\n"
+                "Try asking about:\n"
+                "• System monitoring\n"
+                "• CSV data analysis\n"
+                "• File operations\n"
+                "• Git commands",
+                border_style="cyan",
+                title="Enhanced Tool System"
             )
             self.console.print(no_interactions_panel)
             return
         
-        csv_interactions_count = 0
+        tool_usage_count = {"local": 0, "remote": 0, "filesystem": 0, "git": 0}
+        
         for interaction in recent_interactions:
             timestamp = interaction.timestamp.split('T')[1].split('.')[0]
             
-            if interaction.server_name == "csv_analysis":
-                csv_interactions_count += 1
+            server_type = "local"
+            if "remote" in interaction.server_name:
+                server_type = "remote"
+                tool_usage_count["remote"] += 1
+            elif "filesystem" in interaction.server_name:
+                server_type = "filesystem"
+                tool_usage_count["filesystem"] += 1
+            elif "git" in interaction.server_name:
+                server_type = "git"
+                tool_usage_count["git"] += 1
+            else:
+                tool_usage_count["local"] += 1
             
             if interaction.status == "success":
                 status_display = f"[{self.colors['success']}]✓[/]"
             else:
                 status_display = f"[{self.colors['error']}]✗[/]"
             
-            if interaction.server_name == "csv_analysis":
-                server_display = f"[bold green]{interaction.server_name}[/bold green]"
-                tool_display = f"[bold green]{interaction.request_type}[/bold green]"
+            if server_type == "remote":
+                server_display = f"[bold magenta]{interaction.server_name}[/bold magenta]"
+                tool_display = f"[bold magenta]{interaction.request_type}[/bold magenta]"
             else:
                 server_display = interaction.server_name
                 tool_display = interaction.request_type
@@ -1279,17 +1355,21 @@ class EnhancedTerminalUI:
                 timestamp,
                 server_display,
                 tool_display,
-                status_display
+                status_display,
+                server_type.title()
             )
         
         self.console.print(log_table)
         
         summary_panel = Panel(
-            f"[green]CSV interactions detected: {csv_interactions_count}[/green]\n"
+            f"[green]Local tools used: {tool_usage_count['local']}[/green]\n"
+            f"[magenta]Remote tools used: {tool_usage_count['remote']}[/magenta]\n"
+            f"[blue]Filesystem tools used: {tool_usage_count['filesystem']}[/blue]\n"
+            f"[yellow]Git tools used: {tool_usage_count['git']}[/yellow]\n"
             f"[cyan]Total interactions: {len(recent_interactions)}[/cyan]\n"
-            f"[yellow]{'MCP SERVER BEING USED CORRECTLY' if csv_interactions_count > 0 else 'NO CSV SERVER CALLS DETECTED'}[/yellow]",
-            title="MCP Usage Summary",
-            border_style="green" if csv_interactions_count > 0 else "yellow"
+            f"[bold]ENHANCED MCP SYSTEM ACTIVE[/bold]",
+            title="Enhanced Tool Usage Summary",
+            border_style="green"
         )
         self.console.print(summary_panel)
     
@@ -1337,61 +1417,54 @@ class EnhancedTerminalUI:
             title="Information"
         )
         self.console.print(info_panel)
-    
-    def show_mcp_verification_reminder(self):
-        reminder_panel = Panel(
-            "[yellow]REMINDER:[/yellow]\n"
-            "Use [bold cyan]/log[/bold cyan] to verify MCP tools are being used\n",
-            border_style="cyan",
-            title="MCP Verification"
-        )
-        self.console.print(reminder_panel)
 
 class EnhancedMCPChatbot(MCPChatbot):
     def __init__(self, api_key=None):
         super().__init__(api_key)
         self.ui = EnhancedTerminalUI()
         self.current_mode = "menu"
-        self.tool_executor = None
     
-    async def test_csv_server_connection(self):
+    async def test_remote_server_connection(self):
         try:
-            if not await self.server_manager.validate_server_connection("csv_analysis"):
-                return False
-            
-            result = await self.server_manager.call_tool(
-                "csv_analysis", 
-                "debug_workspace", 
-                {}
-            )
-            
-            if result.get("isError", False):
-                return False
-            
-            return True
-            
-        except Exception as e:
+            if "remote_system_monitor" in self.server_manager.remote_clients:
+                result = await self.server_manager.validate_server_connection("remote_system_monitor")
+                return result
+            return False
+        except Exception:
             return False
     
     async def enhanced_chat_loop(self):
         self.ui.show_welcome_screen()
         
-        progress, task = self.ui.show_progress("Initializing MCP servers...")
+        progress, task = self.ui.show_progress("Initializing enhanced MCP system...")
         with progress:
             await self.initialize_servers()
-            self.tool_executor = MCPToolExecutor(self.server_manager)
             
-            csv_working = await self.test_csv_server_connection()
-            if not csv_working:
-                self.ui.show_error("CSV server is not working correctly")
-        
-        self.ui.show_success("All MCP servers initialized")
+            local_working = await self.server_manager.validate_server_connection("csv_analysis") if "csv_analysis" in self.server_manager.servers else False
+            remote_working = await self.test_remote_server_connection()
+            filesystem_working = await self.server_manager.validate_server_connection("filesystem") if "filesystem" in self.server_manager.servers else False
+            
+            status_messages = []
+            if filesystem_working:
+                status_messages.append("Filesystem server OK")
+            else:
+                status_messages.append("Filesystem server ISSUES")
+                
+            if local_working:
+                status_messages.append("CSV server OK")
+            if remote_working:
+                status_messages.append("Remote server OK")
+                
+            if filesystem_working and (local_working or remote_working):
+                self.ui.show_success(f"Servers initialized: {', '.join(status_messages)}")
+            else:
+                self.ui.show_error(f"Some servers have issues: {', '.join(status_messages)}")
         
         while True:
             try:
                 if self.current_mode == "menu":
                     self.ui.show_main_menu()
-                    self.ui.show_server_status(self.server_manager.servers)
+                    self.ui.show_server_status(self.server_manager.servers, self.server_manager.remote_clients)
                     
                     user_input = self.ui.get_user_input("Select an option").strip()
                     
@@ -1426,21 +1499,22 @@ class EnhancedMCPChatbot(MCPChatbot):
                     
                     self.ui.display_message("user", user_input)
                     
-                    intent = self.tool_executor.detect_tool_intent(user_input)
-                    
+                    progress, task = self.ui.show_progress("Analyzing request and selecting tools...")
                     mcp_result = None
-                    if intent['intent']:
-                        progress, task = self.ui.show_progress("Executing real MCP tools...")
-                        try:
-                            with progress:
-                                mcp_result = await self.execute_mcp_tool_safely(intent, user_input)
-                        except Exception as e:
-                            mcp_result = f"Error executing MCP tool: {str(e)}"
+                    
+                    try:
+                        with progress:
+                            analysis = await self.intelligent_executor.analyze_user_request(user_input)
+                            
+                            if analysis.get("needs_tools", False):
+                                mcp_result = await self.intelligent_executor.execute_intelligent_tool_call(analysis)
+                    except Exception as e:
+                        mcp_result = f"Error in intelligent tool execution: {str(e)}"
                     
                     if mcp_result:
                         enhanced_input = f"""User asked: {user_input}
 
-Result from MCP tool (REAL):
+Result from MCP tool execution:
 {mcp_result}
 
 Interpret and present this result clearly and usefully for the user. Highlight the most important insights and present the information in an organized way."""
@@ -1449,7 +1523,7 @@ Interpret and present this result clearly and usefully for the user. Highlight t
                     else:
                         self.context.add_message("user", user_input)
                     
-                    progress, task = self.ui.show_progress("Claude interpreting results...")
+                    progress, task = self.ui.show_progress("Claude generating response...")
                     try:
                         with progress:
                             system_message, messages = self.context.get_messages_for_api()
@@ -1460,27 +1534,12 @@ Interpret and present this result clearly and usefully for the user. Highlight t
                     self.context.add_message("assistant", response)
                     self.ui.display_message("assistant", response)
                     
-                    if any(keyword in user_input.lower() for keyword in ["csv", "archivo", "analizar", "estadisticas", "correlacion", "outliers", "estudiantes", "ventas", "simple", "histograma", "grafico"]):
-                        self.ui.show_mcp_verification_reminder()
-                    
             except KeyboardInterrupt:
                 if self.ui.get_confirmation("\nDo you want to exit the program?"):
                     break
                 continue
             except Exception as e:
                 self.ui.show_error(f"Unexpected error: {str(e)}")
-    
-    async def execute_mcp_tool_safely(self, intent, user_input):
-        try:
-            result = await asyncio.wait_for(
-                self.tool_executor.execute_tool_for_intent(intent, user_input),
-                timeout=30.0
-            )
-            return result
-        except asyncio.TimeoutError:
-            return "Timeout: MCP tool took too long to respond"
-        except Exception as e:
-            return f"Error in MCP tool: {str(e)}"
     
     def show_tools_interface(self):
         self.ui.clear_screen()
@@ -1490,9 +1549,9 @@ Interpret and present this result clearly and usefully for the user. Highlight t
     
     def show_servers_interface(self):
         self.ui.clear_screen()
-        self.ui.show_server_status(self.server_manager.servers)
+        self.ui.show_server_status(self.server_manager.servers, self.server_manager.remote_clients)
         
-        if self.server_manager.external_servers:
+        if self.server_manager.external_servers or self.server_manager.remote_clients:
             self.ui.console.print("\n" + self.server_manager.get_external_servers_summary())
         
         input("\nPress Enter to continue...")
@@ -1511,7 +1570,7 @@ async def enhanced_main():
         
     except Exception as e:
         console = Console()
-        console.print(f"[red]Error initializing chatbot: {str(e)}[/red]")
+        console.print(f"[red]Error initializing enhanced chatbot: {str(e)}[/red]")
 
 if __name__ == "__main__":
     asyncio.run(enhanced_main())
